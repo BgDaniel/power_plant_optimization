@@ -15,8 +15,8 @@ class OperationalState(Enum):
 
     IDLE = 0  # The plant is idle (not generating power).
     RAMPING_UP = 1  # The plant is ramping up to generate power.
-    RUNNING = 2  # The plant is actively generating power.
-    RAMPING_DOWN = 3  # The plant is ramping down from power generation.
+    RAMPING_DOWN = 2  # The plant is ramping down from power generation.
+    RUNNING = 3  # The plant is actively generating power.
 
 
 class OptimalControl(Enum):
@@ -51,7 +51,7 @@ def get_next_state(
 
     elif current_optimal_state == OperationalState.RUNNING:
         if optimal_control == OptimalControl.RAMPING_DOWN:
-            return OperationalState.IDLE
+            return OperationalState.RAMPING_DOWN
         else:  # DO_NOTHING
             return OperationalState.RUNNING  # Stay running
 
@@ -162,7 +162,7 @@ class PowerPlant:
         # 3: running
         self.cashflows[-1, :, 3] = -self.operation_costs + self.alpha * self.spread.iloc[-1, :]
 
-        self.optimal_value[-1, :, :] = self.cashflows[-1, :, :]
+        self.value[-1, :, :] = self.cashflows[-1, :, :]
 
     def _regress(self, i_day: int, j_state: int, plot: bool = False) -> None:
         """Regresses the optimal value for the given day and state against the polynomial features of power and coal prices.
@@ -184,7 +184,7 @@ class PowerPlant:
         X_poly = poly.fit_transform(X)
 
         # Extract the optimal value for the given day and state
-        y = self.optimal_value[i_day + 1, :, j_state]
+        y = self.value[i_day + 1, :, j_state]
 
         # Perform the regression
         model = LinearRegression()
@@ -195,14 +195,14 @@ class PowerPlant:
         print(f"R² Score for day {i_day} and state {j_state}: {r2_score:.4f}")
 
         # Update the optimal value using the regression coefficients
-        regressed_optimal_value = model.predict(X_poly)
+        regressed_value = model.predict(X_poly)
 
         # Plotting if requested
         if plot:
             self._plot_3d_regression(X, y, model, X_poly, poly, i_day, j_state)
 
         # Optionally, return the model or coefficients if you need them
-        return regressed_optimal_value
+        return regressed_value
 
     def _plot_3d_regression(self, X, y, model, X_poly, poly, i_day, j_state):
         """Plots the actual vs predicted values and the regression surface in 3D."""
@@ -243,16 +243,18 @@ class PowerPlant:
         plt.show()
 
     def _optimize(self, i_day: int):
-        regressed_optimal_value = np.zeros((self.market_simulation.num_days, n_sims, 4))
+        regressed_value = np.zeros((self.market_simulation.num_days, n_sims, 4))
 
         for j_state in range(4):
-            regressed_optimal_value[i_day, :, j_state] = self._regress(i_day, j_state)
+            regressed_value[i_day, :, j_state] = self._regress(i_day, j_state)
 
         # 0: idle state
-        continuation_value = regressed_optimal_value[i_day, :, 0]
-        exercise_value = -self.ramping_up_costs + regressed_optimal_value[i_day, :, 1]
+        continuation_value = regressed_value[i_day, :, 0]
+        exercise_value = regressed_value[i_day, :, 1]
 
-        self.optimal_value[i_day, :, 0] = -self.idle_costs + np.maximum(
+        self.cashflows[i_day, :, 0] = -self.idle_costs
+
+        self.value[i_day, :, 0] = -self.idle_costs + np.maximum(
             continuation_value, exercise_value
         )
         # Set the optimal control decision based on the comparison of continuation_value and exercise_value
@@ -264,17 +266,24 @@ class PowerPlant:
 
         # 1: ramping up
         # no decision to be made
-        self.optimal_value[i_day, :, 1] = - self.ramping_up_costs + regressed_optimal_value[i_day, :, 3]
+        self.cashflows[i_day,: ,1] = - self.ramping_up_costs
+        self.value[i_day, :, 1] = - self.ramping_up_costs + regressed_value[i_day, :, 3]
 
         # 2: ramping down
         # no decision to be made
-        self.optimal_value[i_day, :, 2] =  - self.ramping_down_costs + regressed_optimal_value[i_day, :, 0]
+        self.cashflows[i_day,: ,2] = - self.ramping_down_costs
+        self.value[i_day, :, 2] =  - self.ramping_down_costs + regressed_value[i_day, :, 0]
 
         # 3: running
-        continuation_value = -self.operation_costs + regressed_optimal_value[i_day, :, 3]
-        exercise_value = -self.ramping_down_costs + regressed_optimal_value[i_day, :, 2]
+        continuation_value = regressed_value[i_day, :, 3]
+        exercise_value =  regressed_value[i_day, :, 2]
 
-        self.optimal_value[i_day, :, 3] = np.maximum(continuation_value, exercise_value)
+        self.cashflows[i_day, :, 3] = -self.operation_costs + self.alpha*self.spread.iloc[i_day]
+
+        self.value[i_day, :, 3] = -self.operation_costs + self.alpha*self.spread.iloc[i_day]+ np.maximum(
+            continuation_value, exercise_value
+        )
+
         # Set the optimal control decision based on the comparison of continuation_value and exercise_value
         self.optimal_control_decision[i_day, :, 3] = np.where(
             continuation_value > exercise_value,
@@ -303,7 +312,7 @@ class PowerPlant:
             OptimalControl.DO_NOTHING,
             dtype=OptimalControl,
         )
-        self.optimal_value = np.zeros((self.market_simulation.num_days, n_sims, 4))
+        self.value = np.zeros((self.market_simulation.num_days, n_sims, 4))
 
         # Run the market simulation for day-ahead power and coal prices
         _, _, self.day_ahead_power, self.day_ahead_coal = self.market_simulation.simulate(n_sims)
@@ -318,15 +327,16 @@ class PowerPlant:
             self._optimize(i_day)
 
     def value_along_path(self, initial_state: OperationalState, simulation_path: int):
-        optimal_value_along_path = np.zeros(self.market_simulation.num_days)
-        optimal_value_along_path[0] = self.optimal_value[0, simulation_path, initial_state.value]
+        value_along_path = np.zeros(self.market_simulation.num_days)
+        cashflow_along_path = np.zeros(self.market_simulation.num_days)
+        value_along_path[0] = self.value[0, simulation_path, initial_state.value]
+        cashflow_along_path[0] =self.cashflows[0, simulation_path, initial_state.value]
 
         optimal_states_along_path = np.full(
             self.market_simulation.num_days,
-            OptimalControl.DO_NOTHING,
+            initial_state,
             dtype=OperationalState,
         )
-        optimal_states_along_path[0] = initial_state
 
         optimal_control_along_path = np.full(
             self.market_simulation.num_days - 1,
@@ -334,22 +344,29 @@ class PowerPlant:
             dtype=OptimalControl,
         )
 
-        for i_day in range(1, self.market_simulation.num_days - 1):
+        for i_day in range(1, self.market_simulation.num_days):
+            current_optimal_state = optimal_states_along_path[i_day - 1]
+
+
             optimal_control = self.optimal_control_decision[
-                i_day - 1, simulation_path, initial_state.value
+                i_day - 1, simulation_path, current_optimal_state.value 
             ]
             optimal_control_along_path[i_day - 1] = optimal_control
 
-            current_optimal_state = optimal_states_along_path[i_day - 1]
+            
 
             optimal_state = get_next_state(current_optimal_state, optimal_control)
 
             optimal_states_along_path[i_day] = optimal_state
-            optimal_value_along_path[i_day] = self.optimal_value[
+
+            cashflow_along_path[i_day]=self.cashflows[
+                i_day, simulation_path, optimal_state.value
+            ]
+            value_along_path[i_day] = self.value[
                 i_day, simulation_path, optimal_state.value
             ]
 
-        return optimal_value_along_path, optimal_states_along_path, optimal_control_along_path
+        return value_along_path, optimal_states_along_path, optimal_control_along_path, cashflow_along_path
 
     def plot_optimization_results(
         self, initial_state: OperationalState, simulation_path: int
@@ -366,13 +383,14 @@ class PowerPlant:
 
         # Get the optimal value and control decisions along the path
         (
-            optimal_value_along_path,
+            value_along_path,
             optimal_states_along_path,
             optimal_control_along_path,
+            cashflow_along_path
         ) = self.value_along_path(initial_state, simulation_path)
 
         # Create the plot figure with four subplots
-        fig, axes = plt.subplots(4, 1, figsize=(12, 20))
+        fig, axes = plt.subplots(5, 1, figsize=(12, 20))
 
         # Plot the spot prices (Power and Coal)
         axes[0].plot(power_prices.index, power_prices.values, label="Power Price", color='blue')
@@ -384,69 +402,124 @@ class PowerPlant:
 
         # Plot the optimal value along the simulation path
         axes[1].plot(
-            power_prices.index, optimal_value_along_path, label="Optimal Value", color='green'
+            power_prices.index, value_along_path, label="Optimal Value", color='green'
         )
         axes[1].set_title("Optimal Value along Simulation Path")
         axes[1].set_xlabel("Date")
         axes[1].set_ylabel("Optimal Value")
 
+        # Plot the optimal value along the simulation path
+        axes[2].plot(
+            power_prices.index, cashflow_along_path, label="Cashflow along path", color='red'
+        )
+
         # Plot the control decisions along the simulation path as markers
+        has_ramping_up_label_written = False
+        has_ramping_down_label_written =False
+        has_idle_label_written = False
+        has_do_nothing_label_written = False
+        
         for i, control in enumerate(optimal_control_along_path):
             if control == OptimalControl.RAMPING_UP:
-                axes[2].scatter(
-                    power_prices.index[i],
-                    optimal_value_along_path[i],
-                    color='green',
-                    marker='x',
-                    label="Ramping Up" if i == 0 else "",
-                )
-            elif control == OptimalControl.RAMPING_DOWN:
-                axes[2].scatter(
-                    power_prices.index[i],
-                    optimal_value_along_path[i],
-                    color='red',
-                    marker='o',
-                    label="Ramping Down" if i == 0 else "",
-                )
-            else:  # DO_NOTHING
-                axes[2].scatter(
-                    power_prices.index[i],
-                    optimal_value_along_path[i],
-                    color='blue',
-                    marker='o',
-                    label="Do Nothing" if i == 0 else "",
-                )
 
-        axes[2].set_title("Control Decisions along Simulation Path")
-        axes[2].set_xlabel("Date")
-        axes[2].set_ylabel("Control Decision")
-        axes[2].legend()
+                if not has_ramping_up_label_written:
+                    has_ramping_up_label_written = True
+                    axes[3].scatter(
+                            power_prices.index[i],
+                            value_along_path[i],
+                            color='green',
+                            marker='x',
+                            label="Ramping Up",
+                            s=30.0
+                        )
+                else:
+                    axes[3].scatter(
+                            power_prices.index[i],
+                            value_along_path[i],
+                            color='green',
+                            marker='x',
+                            s=15.0
+                        )
+
+
+
+            elif control == OptimalControl.RAMPING_DOWN:
+                if not has_ramping_down_label_written:
+                    has_ramping_down_label_written = True
+                    axes[3].scatter(
+                        power_prices.index[i],
+                        value_along_path[i],
+                        color='red',
+                        marker='o',
+                        label="Ramping Down",
+                        s=15.0
+                    )
+                else:
+                    axes[3].scatter(
+                        power_prices.index[i],
+                        value_along_path[i],
+                        color='red',
+                        marker='o',
+                        s=15.0
+                    )
+            else:  # DO_NOTHING
+                if not has_do_nothing_label_written:
+                    has_do_nothing_label_written = True
+                    axes[3].scatter(
+                        power_prices.index[i],
+                        value_along_path[i],
+                        color='yellow',
+                        marker='o',
+                        label="Ramping Down",
+                        s=5.0
+                    )
+                else:
+                    axes[3].scatter(
+                        power_prices.index[i],
+                        value_along_path[i],
+                        color='yellow',
+                        marker='o',
+                        s=5.0
+                    )
+
+        axes[3].set_title("Control Decisions along Simulation Path")
+        axes[3].set_xlabel("Date")
+        axes[3].set_ylabel("Control Decision")
+        axes[3].legend()
 
         # Plot the states along the simulation path as markers
         for i, state in enumerate(optimal_states_along_path):
             if state == OperationalState.IDLE:
-                axes[3].scatter(
+                axes[4].scatter(
                     power_prices.index[i],
-                    optimal_value_along_path[i],
+                    value_along_path[i],
                     color='blue',
                     marker='o',
                     label="Idle" if i == 0 else "",
                 )
             elif state == OperationalState.RAMPING_UP:
-                axes[3].scatter(
+                axes[4].scatter(
                     power_prices.index[i],
-                    optimal_value_along_path[i],
+                    value_along_path[i],
                     color='green',
                     marker='x',
                     label="Ramping Up" if i == 0 else "",
                 )
             elif state == OperationalState.RAMPING_DOWN:
-                axes[3].scatter(
+                axes[4].scatter(
                     power_prices.index[i],
-                    optimal_value_along_path[i],
+                    value_along_path[i],
                     color='red',
                     marker='s',
                     label="Ramping Down" if i == 0 else "",
+                )
+            elif state == OperationalState.RUNNING:
+                axes[4].scatter(
+                    power_prices.index[i],
+                    value_along_path[i],
+                    color='yellow',
+                    marker='o',
+                    label="Running" if i == 0 else "",
                 )
 
         axes[3].set_title("States along Simulation Path")
@@ -463,8 +536,8 @@ if __name__ == "__main__":
     # Simulation parameters
     simulation_start = date(2024, 1, 1)
     simulation_end = date(2024, 12, 31)
-    power_volatility = 0.0  # 20% annualized volatility
-    coal_volatility = 0.0  # 15% annualized volatility
+    power_volatility = 0.2  # 20% annualized volatility
+    coal_volatility = 0.25  # 15% annualized volatility
     correlation = 0.7  # Positive correlation
 
     # Power curve rises faster than coal but starts lower
@@ -475,15 +548,15 @@ if __name__ == "__main__":
 
     # Coal curve falls over time, but starts higher
     fwd_curve_coal = pd.Series(
-        data=[130, 128, 126, 124, 122, 120, 118, 116, 114, 112, 110, 108],  # Coal falls over time
+        data=[120, 128, 116, 104, 95, 85, 70, 95, 114, 120, 130, 110],  # Coal falls over time
         index=pd.period_range(start="2024-01", end="2024-12", freq="M"),
     )
 
     # Parameters for the mean-reverting OU process
-    sigma_ou_power = 0.0
-    sigma_ou_coal = 0.0
-    beta_power = 1.0
-    beta_coal = 2.0
+    sigma_ou_power = 0.05
+    sigma_ou_coal = 0.07
+    beta_power = 10.0
+    beta_coal = 15.0
 
     # Operational costs
     operation_costs = 2  # Example value
@@ -519,10 +592,10 @@ if __name__ == "__main__":
     )
 
     # Run the simulation
-    n_sims = 5000
+    n_sims = 100
     power_plant.optimize(n_sims)
 
-    simulation_path = 101  # Example path index to plot
+    simulation_path = 55  # Example path index to plot
     power_plant.plot_optimization_results(
         initial_state=OperationalState.IDLE, simulation_path=simulation_path
     )
